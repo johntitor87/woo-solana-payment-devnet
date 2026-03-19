@@ -5,6 +5,16 @@ const { Connection, PublicKey } = require('@solana/web3.js');
 const app = express();
 app.use(bodyParser.json());
 
+// Root route (Render will show "Cannot GET /" without this)
+app.get("/", (req, res) => {
+  res.send("Zoo Solana Checkout API running");
+});
+
+// Health check (used by Render health checks)
+app.get("/health", (req, res) => {
+  res.send("OK");
+});
+
 // Devnet connection
 const connection = new Connection("https://api.devnet.solana.com", "confirmed");
 
