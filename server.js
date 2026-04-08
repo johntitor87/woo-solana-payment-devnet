@@ -1,13 +1,11 @@
-// 1. Imports (TOP)
-const express = require('express');
-const bodyParser = require('body-parser');
-const { Connection, PublicKey } = require('@solana/web3.js');
+const express = require("express");
+const bodyParser = require("body-parser");
+const { Connection, PublicKey } = require("@solana/web3.js");
+const { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } = require("@solana/spl-token");
 
-// 2. App setup
 const app = express();
 app.use(bodyParser.json());
 
-// 3. Routes (simple ones first)
 app.get("/", (req, res) => {
   res.send("Zoo Solana Checkout API running");
 });
@@ -16,128 +14,251 @@ app.get("/health", (req, res) => {
   res.send("OK");
 });
 
-// 4. Connection (ONLY ONCE)
 const connection = new Connection("https://api.devnet.solana.com", "confirmed");
 
-// 5. Helper functions
-async function waitForFinalizedTx(signature) {
-  const maxRetries = 8;
-  const delay = 1500;
+// 🔑 Set via env on Render, or use these devnet defaults
+const DEFAULT_ZOO_MINT =
+  process.env.ZOO_MINT_ADDRESS || process.env.ZOO_MINT || "FKkgeZxYLxoZ1WciErXKbeNTf5CB296zv51euCR7MZN3";
+const DEFAULT_SHOP_WALLET =
+  process.env.SHOP_WALLET || process.env.ZOO_SHOP_WALLET || "6XPtpWPgFfoxRcLCwxTKXawrvzeYjviw4EYpSSLW42gc";
 
-  for (let i = 0; i < maxRetries; i++) {
-    const tx = await connection.getParsedTransaction(signature, {
-      commitment: "finalized",
-      maxSupportedTransactionVersion: 0
-    });
+const ZOO_TOKEN_MINT = new PublicKey(DEFAULT_ZOO_MINT);
+const RECEIVER_WALLET = new PublicKey(DEFAULT_SHOP_WALLET);
 
-    if (tx) {
-      console.log(`[ZOO] TX found on attempt ${i + 1}`);
-      return tx;
-    }
+/** Receiving side of the SPL transfer is the shop's ATA for this mint — NOT the wallet pubkey. */
+let RECEIVER_TOKEN_ACCOUNT_BASE58;
+try {
+  RECEIVER_TOKEN_ACCOUNT_BASE58 = getAssociatedTokenAddressSync(
+    ZOO_TOKEN_MINT,
+    RECEIVER_WALLET,
+    false,
+    TOKEN_PROGRAM_ID
+  ).toBase58();
+} catch (e) {
+  console.error("[ZOO] Failed to derive receiver ATA:", e);
+  RECEIVER_TOKEN_ACCOUNT_BASE58 = null;
+}
 
-    console.log(`[ZOO] Waiting for tx... attempt ${i + 1}`);
-    await new Promise(res => setTimeout(res, delay));
+/** Confirms this codebase is live (very old/stub deploys return 404 here). */
+app.get("/api-meta", (req, res) => {
+  res.json({
+    ok: true,
+    verifier: "woo-solana-payment-devnet",
+    version: 2,
+    mint: ZOO_TOKEN_MINT.toBase58(),
+    shopWallet: RECEIVER_WALLET.toBase58(),
+    shopTokenAccount: RECEIVER_TOKEN_ACCOUNT_BASE58 || null,
+  });
+});
+
+const SPL_TOKEN_PROGRAM_ID_STR = TOKEN_PROGRAM_ID.toBase58();
+
+// retry helper (finalized commitment inside getParsedTransaction)
+async function getTxWithRetry(signature, retries = 8, delay = 1500) {
+  for (let i = 0; i < retries; i++) {
+    const tx = await connection
+      .getParsedTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      })
+      .catch(() => null);
+
+    if (tx && !tx.meta?.err) return tx;
+
+    console.log(`[ZOO] Waiting for tx... attempt ${i + 1}/${retries}`);
+    await new Promise((res) => setTimeout(res, delay));
   }
-
   return null;
 }
 
-function expectedAmountToRawBigInt(expectedAmount, decimals) {
-  const dec = Number(decimals);
-  if (!Number.isInteger(dec) || dec < 0) return null;
-
-  const str = String(expectedAmount);
-  if (!/^\d+(\.\d+)?$/.test(str)) return null;
-
-  const [whole, frac = ""] = str.split(".");
-  const wholeBig = BigInt(whole);
-  const factor = 10n ** BigInt(dec);
-
-  const fracPadded = frac.padEnd(dec, "0");
-  return wholeBig * factor + BigInt(fracPadded || "0");
+function isSplTokenTransferIx(ix) {
+  const t = ix?.parsed?.type;
+  if (t !== "transfer" && t !== "transferChecked") return false;
+  if (ix.program === "spl-token") return true;
+  const pid = ix.programId?.toBase58?.() || ix.programId;
+  return pid === SPL_TOKEN_PROGRAM_ID_STR;
 }
 
-// 6. State
+/** Outer + inner — many wallets put the token ix in inner instructions. */
+function collectInstructions(tx) {
+  const out = [];
+  const msg = tx.transaction?.message;
+  if (msg?.instructions?.length) {
+    for (const ix of msg.instructions) out.push(ix);
+  }
+  const inner = tx.meta?.innerInstructions;
+  if (Array.isArray(inner)) {
+    for (const group of inner) {
+      if (group?.instructions?.length) {
+        for (const ix of group.instructions) out.push(ix);
+      }
+    }
+  }
+  return out;
+}
+
+function findSplTransfer(ixs) {
+  return ixs.find((ix) => isSplTokenTransferIx(ix));
+}
+
+// Minimal replay protection (in-memory)
 const usedSignatures = new Set();
-const inFlightSignatures = new Set();
 
-const DEFAULT_ZOO_MINT = process.env.ZOO_MINT_ADDRESS || process.env.ZOO_MINT || 'FKkgeZxYLxoZ1WciErXKbeNTf5CB296zv51euCR7MZN3';
-const DEFAULT_SHOP_WALLET = process.env.SHOP_WALLET || process.env.ZOO_SHOP_WALLET || '6XPtpWPgFfoxRcLCwxTKXawrvzeYjviw4EYpSSLW42gc';
+function jsonFail(res, status, message, extra = {}) {
+  return res.status(status).json({
+    success: false,
+    message,
+    error: message,
+    ...extra,
+  });
+}
 
-// 7. MAIN ROUTE (THIS is where verification logic lives)
-app.post("/verify-devnet-payment", async (req, res) => {
-  let addedToInFlight = false;
-  
+function jsonOk(res, data) {
+  return res.json({ success: true, ...data });
+}
+
+async function handleVerify(req, res) {
   try {
-    const { signature, expectedAmount } = req.body || {};
+    const {
+      signature,
+      expectedAmount,
+      walletAddress,
+      shopWallet: requestShopWallet,
+      mint: requestMint,
+    } = req.body || {};
 
-    if (!signature) {
-      return res.status(400).json({ success: false, message: "Missing signature" });
+    const mintStr = typeof requestMint === "string" && requestMint ? requestMint : ZOO_TOKEN_MINT.toBase58();
+    const shopStr =
+      typeof requestShopWallet === "string" && requestShopWallet ? requestShopWallet : RECEIVER_WALLET.toBase58();
+
+    let mintPk;
+    let shopPk;
+    try {
+      mintPk = new PublicKey(mintStr);
+      shopPk = new PublicKey(shopStr);
+    } catch {
+      return jsonFail(res, 400, "Invalid mint or shop wallet");
+    }
+
+    let receiverAtaBase58;
+    try {
+      receiverAtaBase58 = getAssociatedTokenAddressSync(mintPk, shopPk, false, TOKEN_PROGRAM_ID).toBase58();
+    } catch {
+      return jsonFail(res, 400, "Could not derive receiver token account");
+    }
+
+    console.log("[ZOO] Verifying:", signature, { expectedAmount, mint: mintStr, shop: shopStr });
+
+    if (!signature || typeof signature !== "string") {
+      return jsonFail(res, 400, "Missing signature");
     }
 
     if (usedSignatures.has(signature)) {
-      return res.json({ success: false, message: "Already used" });
+      return res.status(200).json({ success: false, message: "Signature already used", error: "Signature already used" });
     }
 
-    if (inFlightSignatures.has(signature)) {
-      return res.json({ success: false, message: "Processing" });
+    if (expectedAmount === undefined || expectedAmount === null || Number.isNaN(Number(expectedAmount))) {
+      return jsonFail(res, 400, "Missing expectedAmount");
     }
 
-    inFlightSignatures.add(signature);
-    addedToInFlight = true;
+    const tx = await getTxWithRetry(signature);
 
-    // Use waitForFinalizedTx to wait for the transaction
-    const tx = await waitForFinalizedTx(signature);
-
-    if (!tx || !tx.meta || tx.meta.err) {
-      return res.json({ success: false, message: "Invalid transaction" });
+    if (!tx) {
+      return jsonFail(res, 400, "Transaction not found");
     }
 
-    let valid = false;
+    const instructions = collectInstructions(tx);
+    const transferIx = findSplTransfer(instructions);
 
-    for (const ix of tx.transaction.message.instructions) {
-      const info = ix?.parsed?.info;
-      if (!info) continue;
-
-      if (info.mint !== DEFAULT_ZOO_MINT) continue;
-
-      const destinationMatches =
-        info.destination === DEFAULT_SHOP_WALLET ||
-        info.destinationOwner === DEFAULT_SHOP_WALLET;
-
-      if (!destinationMatches) continue;
-
-      const decimals = info.tokenAmount?.decimals;
-      if (typeof decimals !== "number") continue;
-
-      const rawAmount = BigInt(info.amount);
-      const expectedRaw = expectedAmountToRawBigInt(expectedAmount, decimals);
-
-      if (rawAmount === expectedRaw) {
-        valid = true;
-        break;
-      }
+    if (!transferIx) {
+      console.log("[ZOO] No SPL transfer instruction found");
+      return jsonFail(res, 400, "No token transfer found");
     }
 
-    if (valid) {
-      usedSignatures.add(signature);
+    const info = transferIx.parsed.info;
+    console.log("[ZOO] Transfer info:", JSON.stringify(info, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
+
+    // ✅ Validate mint when present (transferChecked). Legacy transfer may omit mint — then destination must be shop ATA.
+    if (typeof info.mint === "string" && info.mint !== mintPk.toBase58()) {
+      return jsonFail(res, 400, "Wrong token mint");
+    }
+    if (!info.mint && info.destination !== receiverAtaBase58) {
+      return jsonFail(res, 400, "Wrong token mint or destination (legacy transfer)");
     }
 
-    res.json({ success: valid });
+    // ✅ Destination: token account for shop (ATA), not the wallet pubkey
+    const destOk =
+      info.destination === receiverAtaBase58 ||
+      info.destination === shopPk.toBase58() ||
+      info.destinationOwner === shopPk.toBase58();
 
+    if (!destOk) {
+      return jsonFail(res, 400, "Wrong destination wallet", {
+        expectedDestinationAta: receiverAtaBase58,
+        got: info.destination,
+      });
+    }
+
+    const decimals =
+      typeof info.tokenAmount?.decimals === "number"
+        ? info.tokenAmount.decimals
+        : typeof info.decimals === "number"
+          ? info.decimals
+          : 9;
+
+    const rawStr =
+      info.amount != null
+        ? String(info.amount)
+        : info.tokenAmount?.amount != null
+          ? String(info.tokenAmount.amount)
+          : null;
+
+    if (rawStr == null) {
+      return jsonFail(res, 400, "Could not read transfer amount");
+    }
+
+    const rawAmount = Number(rawStr);
+    const adjustedAmount = rawAmount / Math.pow(10, decimals);
+
+    console.log("[ZOO] Amount raw:", rawAmount);
+    console.log("[ZOO] Amount adjusted:", adjustedAmount);
+    console.log("[ZOO] Expected:", expectedAmount);
+
+    const expectedNum = Number(expectedAmount);
+    const tolerance = 0.000001;
+
+    if (Math.abs(adjustedAmount - expectedNum) > tolerance) {
+      return jsonFail(res, 400, "Incorrect amount", {
+        received: adjustedAmount,
+        expected: expectedNum,
+      });
+    }
+
+    if (walletAddress && typeof walletAddress === "string" && info.authority && info.authority !== walletAddress) {
+      return jsonFail(res, 400, "Sender mismatch");
+    }
+
+    usedSignatures.add(signature);
+
+    console.log("[ZOO] ✅ Verification SUCCESS");
+
+    return jsonOk(res, {
+      signature,
+      amount: adjustedAmount,
+    });
   } catch (err) {
-    console.error(err);
-    res.json({ success: false });
-  } finally {
-    const signature = req?.body?.signature;
-    if (addedToInFlight && typeof signature === "string") {
-      inFlightSignatures.delete(signature);
-    }
+    console.error("[ZOO] Verification error:", err);
+    return jsonFail(res, 500, "Verification failed");
   }
-});
+}
 
-// 8. Start server (BOTTOM)
+app.post("/verify-devnet-payment", handleVerify);
+app.post("/verify-zoo-payment", handleVerify);
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`[ZOO] Mint: ${ZOO_TOKEN_MINT.toBase58()}`);
+  console.log(`[ZOO] Shop wallet: ${RECEIVER_WALLET.toBase58()}`);
+  console.log(`[ZOO] Shop token account (destination): ${RECEIVER_TOKEN_ACCOUNT_BASE58 || "n/a"}`);
 });
