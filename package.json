@@ -4,7 +4,9 @@
   "description": "Devnet backend for WooCommerce ZOO token checkout",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "create-mainnet-mint": "node scripts/create-mainnet-zoo-mint.cjs",
+    "mint-more-mainnet": "node scripts/mint-more-mainnet.cjs"
   },
   "dependencies": {
     "express": "^4.18.2",

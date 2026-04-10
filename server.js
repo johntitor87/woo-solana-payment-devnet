@@ -14,7 +14,15 @@ app.get("/health", (req, res) => {
   res.send("OK");
 });
 
-const connection = new Connection("https://api.devnet.solana.com", "confirmed");
+/** Devnet default; override on Render for mainnet (see SOLANA_RPC_URL / SOLANA_NETWORK). */
+const RPC_URL =
+  process.env.SOLANA_RPC_URL ||
+  process.env.RPC_URL ||
+  (String(process.env.SOLANA_NETWORK || "").toLowerCase() === "mainnet-beta"
+    ? "https://api.mainnet-beta.solana.com"
+    : "https://api.devnet.solana.com");
+
+const connection = new Connection(RPC_URL, "confirmed");
 
 // 🔑 Set via env on Render, or use these devnet defaults
 const DEFAULT_ZOO_MINT =
@@ -45,6 +53,7 @@ app.get("/api-meta", (req, res) => {
     ok: true,
     verifier: "woo-solana-payment-devnet",
     version: 2,
+    rpcUrl: RPC_URL,
     mint: ZOO_TOKEN_MINT.toBase58(),
     shopWallet: RECEIVER_WALLET.toBase58(),
     shopTokenAccount: RECEIVER_TOKEN_ACCOUNT_BASE58 || null,
@@ -258,6 +267,7 @@ app.post("/verify-zoo-payment", handleVerify);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`[ZOO] RPC: ${RPC_URL}`);
   console.log(`[ZOO] Mint: ${ZOO_TOKEN_MINT.toBase58()}`);
   console.log(`[ZOO] Shop wallet: ${RECEIVER_WALLET.toBase58()}`);
   console.log(`[ZOO] Shop token account (destination): ${RECEIVER_TOKEN_ACCOUNT_BASE58 || "n/a"}`);
